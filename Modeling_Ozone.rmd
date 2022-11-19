@@ -1,0 +1,277 @@
+---
+title: "Predicting Low-level Ozone Code"
+output: 
+---
+
+```{r, echo = F, warning = F, message = F}
+#libraries
+library(tidyverse) #df manipulation
+library(ggformula) #graphing
+library(VIM) #missing data graphs
+library(DMwR2) #KNN IMP
+library(car) #VIF
+library(caret) #caret function
+library(xgboost) #boosted trees
+
+#reading in data
+Ozone_LA <- read_csv("Ozone_LA.csv")
+
+```
+
+
+```{r, warning = F, message = F, echo = F, fig.align = 'center', fig.height = 6, fig.width = 9}
+#graph of missing data
+aggr(Ozone_LA, numbers=TRUE, sortVars=TRUE, cex.axis=.7, gap=3, 
+     ylab=c("Proportion of missingness","Missingness Pattern"))
+```
+
+```{r, echo = F, results = 'hide'}
+#checking out VIF, i_b_t has a high vif
+fit <- lm(hour_average_max ~ ., data = Ozone_LA)
+vif(fit)
+```
+
+```{r, echo = F}
+#dropping unwanted variables and removings obs with misssing response
+Ozone_LA <- Ozone_LA %>%
+  select(-temp_El_Monte, -day_of_month, -day_of_week, -inversion_base_temp) %>%
+  filter(!is.na(hour_average_max))
+```
+
+```{r, results = 'hide', echo = F}
+#replaces missing values using KNN
+Ozone_LA <- knnImputation(Ozone_LA, k = 10)
+```
+
+```{r, echo = F}
+#transforming response
+Ozone_LA <- Ozone_LA %>%
+  mutate(log.hourMax = log(hour_average_max)) %>%
+  select(-hour_average_max)
+```
+
+```{r, echo = F, results = 'hide'}
+#regsubsets to find best lm
+library(leaps)
+regfit.full <- regsubsets(log.hourMax ~ ., data = Ozone_LA, nvmax = 8)
+
+coef(regfit.full, 4)
+```
+
+```{r, echo = F}
+#model forms
+Model1 <- (log.hourMax ~ month + temp_Sandburg + humidity + inversion_base_height)
+Model2 <- (log.hourMax ~ .)
+
+#boosted tree parameters
+tree_depths <- 1:3
+bag <- c(0.5, 0.75, 1)
+eta.range <- c(0.1, 0.2, 0.3)
+```
+
+```{r, echo = F, results = 'hide'}
+set.seed(1)
+training = trainControl(method = "cv", number = 10)
+dataused <- Ozone_LA
+
+#CV10 OSL
+fit_caret_lm1 = train(Model1,
+                      data = dataused,
+                      method = "lm",
+                      trControl = training)
+
+#CV10 OLS
+fit_caret_lm2 = train(Model2,
+                      data = dataused,
+                      method = "lm",
+                      trControl = training)
+
+#cv10 boosted trees
+fit_caret_boost = train(Model2, 
+                        data = dataused,
+                        method = "xgbTree",
+                        tuneGrid = expand.grid(nrounds = 100, max_depth = tree_depths, 
+                                              eta = eta.range, gamma = 0, 
+                                              colsample_bytree = .8, 
+                                              min_child_weight = 1, subsample = bag),
+                  verbosity = 0, # suppresses a warning about 
+                            # deprecated version of the 
+                            # objective function
+                            # (not necessary for classification)
+                  trControl = training)
+```
+
+```{r, echo = F, results = 'hide'}
+#forming data frame of the results
+results <- data.frame(RSME = c(fit_caret_lm1$results$RMSE, fit_caret_lm2$results$RMSE, fit_caret_boost$results$RMSE),
+                      Model = c('OLS', 'OLS', rep('Boosted Tree', length(fit_caret_boost$results$RMSE))))
+
+exp(fit_caret_boost$results$RMSE)
+fit_caret_boost$finalModel
+```
+
+```{r, warning = F, message = F, echo = F, fig.align = 'center', fig.height = 4, fig.width = 6}
+#graph of results
+gf_point(RSME ~ 1:29, col =~ Model, shape =~ Model, data = results) %>%
+  gf_labs(title = 'RSME for Every Tested Model',
+          subtitle = 'Boosted trees appear to outperform OLS',
+          x = 'Model Tested')
+  
+```
+
+```{r, echo = F, results = 'hide'}
+#results of inner validation
+min(fit_caret_boost$results$RMSE)
+max(fit_caret_boost$results$Rsquared)
+
+#model
+fit_caret_boost$finalModel
+
+fit_caret_boost$results[which.min(fit_caret_boost$results$RMSE), ]
+```
+
+```{r, echo = F, results = 'hide'}
+############# Data Prep #############
+n = dim(Ozone_LA)[1]
+
+###################################################################
+##### Double cross-validation for modeling-process assessment #####				 
+###################################################################
+
+#model forms
+Model1 <- (log.hourMax ~ month + temp_Sandburg + humidity + inversion_base_height)
+Model2 <- (log.hourMax ~ .)
+
+#boosted tree parameters
+tree_depths <- 1:3
+bag <- c(0.5, 0.75, 1)
+eta.range <- c(0.1, 0.2, 0.3)
+
+##### model assessment OUTER shell #####
+# produce loops for 5-fold cross-validation for model ASSESSMENT
+nfolds = 5
+groups = rep(1:nfolds,length=n)  #produces list of group labels
+set.seed(1)
+cvgroups = sample(groups,n)  #orders randomly
+
+# set up storage for predicted values from the double-cross-validation
+allpredictedCV = rep(NA,n)
+# set up storage to see what models are "best" on the inner loops
+allbestTypes = rep(NA,nfolds)
+allbestPars = vector("list",nfolds)
+
+# loop through outer splits
+for (j in 1:nfolds)  {  #be careful not to re-use loop indices
+  groupj = (cvgroups == j)
+  traindata.out = Ozone_LA[!groupj,]
+  validdata = Ozone_LA[groupj,]
+  
+  #specify data to be used
+  dataused = traindata.out
+  
+  ###  entire model-fitting process ###
+  ###  on traindata only!!! ###
+  ###	 :	:	:	:	:	:	:   ###
+  # set up training method
+  set.seed(2)
+  training = trainControl(method = "cv", number = 10)
+  
+  # cross-validation of linear model 1
+  fit_caret_lm1 = train(Model1,
+                      data = dataused,
+                      method = "lm",
+                      trControl = training)
+
+  # cross-validation of linear model 2
+  fit_caret_lm2 = train(Model2,
+                      data = dataused,
+                      method = "lm",
+                      trControl = training)
+  
+
+  #cv boost
+  fit_caret_boost = train(Model2, 
+                        data = dataused,
+                        method = "xgbTree",
+                        tuneGrid = expand.grid(nrounds = 100, max_depth = tree_depths, 
+                                              eta = eta.range, gamma = 0, 
+                                              colsample_bytree = .8, 
+                                              min_child_weight = 1, subsample = bag),
+                  verbosity = 0, # suppresses a warning about 
+                            # deprecated version of the 
+                            # objective function
+                            # (not necessary for classification)
+                  trControl = training)
+
+  ############# identify selected model to fit to full data #############
+  # all best models
+  all_best_Types = c("Linear1","Linear2","Tree_Boost")
+  all_best_Pars = list(4,8,c(fit_caret_boost$bestTune[c(2,3,7)]))
+  all_best_RMSE = c(fit_caret_lm1$results$RMSE,
+                    fit_caret_lm2$results$RMSE,
+                    min(fit_caret_boost$results$RMSE))
+  
+  one_best_Type = all_best_Types[which.min(all_best_RMSE)]
+  one_best_Pars = all_best_Pars[which.min(all_best_RMSE)]
+
+  ###  :	:	:	:	:	:	:   ###
+  ###  resulting in     ###
+  ###  one_best_Type and one_best_Pars and one_best_Model and one_best_Order  ###
+
+  
+  allbestTypes[j] = one_best_Type
+  allbestPars[[j]] = one_best_Pars
+  
+  if (one_best_Type == "Linear1") {
+    allpredictedCV[groupj] = predict(fit_caret_lm1, newdata = validdata)
+  } else if (one_best_Type == "Linear2") {
+    allpredictedCV[groupj] = predict(fit_caret_lm2, newdata = validdata)
+  } else if (one_best_Type == "Tree_Boost") {
+    allpredictedCV[groupj] = predict(fit_caret_boost, newdata = validdata)
+  }
+}
+```
+
+```{r, echo = F, results = 'hide'}
+#assessment
+y = Ozone_LA$log.hourMax
+RMSE = sqrt(mean(allpredictedCV-y)^2); RMSE
+R2 = 1-sum((allpredictedCV-y)^2)/sum((y-mean(y))^2); R2
+# about 68.5% of the variability in BodyFatSiri values is 
+# explained by this model-fitting process
+```
+
+```{r, echo = F, results = 'hide'}
+#most important predictors
+varImp(fit_caret_boost)
+```
+
+```{r, warning = F, message = F, echo = F, fig.align = 'center', fig.height = 7, fig.width = 11}
+#creating new df for graph
+rv <- Ozone_LA %>%
+  select(log.hourMax, inversion_base_height, temp_Sandburg) %>%
+  mutate(HighTemp = case_when(temp_Sandburg >= 70 ~ 'Greater Than 70',
+                              TRUE ~ 'Less Than 70'))
+
+#graph
+gf_point(log.hourMax ~ inversion_base_height, col =~ HighTemp, data = rv) %>%
+  gf_labs(title = 'Log Ozone PPM',
+          subtitle = 'Higher temps associated with higher log ozone levels, higher IBH associated with lower log ozone',
+          caption = 'Source - Ozone_LA',
+          y = 'Log Max Average Ozone PPM',
+          x = 'Inversion Base Height')
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
